@@ -3,6 +3,7 @@
 
 
 import matplotlib.pyplot as plt
+plt.switch_backend('agg')
 
 import numpy as np
 
@@ -21,6 +22,7 @@ import torch.utils.data as Data
 import torchvision
 
 from torch.distributions.beta import Beta
+from torch.distributions.constraints import positive
 from torch.distributions.normal import Normal
 
 
@@ -108,6 +110,24 @@ class AdversarialAutoEncoder(nn.Module):
       (a,b) = self.decoder(z)
       return a, b, z
 
+   def model(self, obs, idx):
+      sz = torch.Size((obs.shape[0], self.zlyrsz))
+      with pyro.plate('forward', obs.shape[0]):
+         mu = obs.new_zeros(sz)
+         sd = obs.new_ones(sz)
+         z = pyro.sample('z', dist.Normal(mu,sd).to_event(1))
+         (a,b) = self.decoder(z)
+         ax = a[:,idx]
+         bx = b[:,idx]
+         pyro.sample('x', dist.Beta(ax, bx).to_event(1), obs=obs)
+
+   def guide(self, obs, idx):
+      sz = torch.Size((obs.shape[0], self.zlyrsz))
+      mu = pyro.param("mu", obs.new_zeros(sz))
+      sd = pyro.param("sd", obs.new_ones(sz), constraint=positive)
+      with pyro.plate('backward', obs.shape[0]):
+         pyro.sample('z', dist.Normal(mu,sd).to_event(1))
+
    def optimize(self, train_data, epochs):
 
       BSZ = 128 # Batch size.
@@ -145,9 +165,9 @@ class AdversarialAutoEncoder(nn.Module):
             # regularization versus the reconstruction. This is
             # done by diluting the loss of the checker and the
             # fooler.
-            self.eval()
-            z_fake = self.encoder(data)
-            z_real = torch.randn(BSZ, 20, **self.dspec)
+            with torch.no_grad():
+               z_fake = self.encoder(data)
+               z_real = torch.randn(BSZ, 20, **self.dspec)
             self.train()
             disc = self.checker(torch.cat((z_fake.detach(), z_real), 0))
             disc_loss = lossf(disc, target_disc) / 10 # <---
@@ -186,32 +206,10 @@ class AdversarialAutoEncoder(nn.Module):
          print '---'
 
 
-def model(aae, obs, idx, device='auto', dtype=torch.float32):
-   dspec = specify_data(device, dtype)
-   sz = (obs.shape[0], aae.zlyrsz)
-   # Move Gaussian parameters to proper device.
-   mu = torch.zeros(sz).to(**dspec)
-   sd = torch.ones(sz).to(**dspec)
-   z = pyro.sample('z', dist.Normal(mu,sd))
-   (a,b) = aae.decoder(z)
-   ax = a[:,idx]
-   bx = b[:,idx]
-   pyro.sample('x', dist.Beta(ax, bx), obs=obs)
-
-
-def guide(aae, obs, idx, device='auto', dtype=torch.float32):
-   dspec = specify_data(device, dtype)
-   sz = (obs.shape[0], aae.zlyrsz)
-   mu = pyro.param("mu", torch.zeros(sz).to(**dspec))
-   sd = pyro.param("sd", torch.ones(sz).to(**dspec))
-   z = pyro.sample('z', dist.Normal(mu,sd))
-
-
 train = torchvision.datasets.MNIST('./', train=True, download=True,
       transform=torchvision.transforms.ToTensor())
 train_data = train.data.view(-1,28*28).to(device='cuda',
       dtype=torch.float32)/255.0
-
 
 AAE = AdversarialAutoEncoder()
 AAE.optimize(train_data, epochs=300)
@@ -230,7 +228,7 @@ samples = 30
 iters = 28
 
 test_samples = test_data[:samples,:].detach().clone()
-obs = torch.clamp(test_samples[:,:392], min=.0001, max=.9999)
+obs = torch.clamp(test_samples[:,:392], min=.001, max=.999)
 
 orig = test_samples.to('cpu').view(-1,28)
 half = test_samples.clone()
@@ -241,24 +239,34 @@ image = np.zeros((28*samples, 28*(iters+2)))
 image[:,:28] = orig
 image[:,28:56] = half.to('cpu')
 
-idx = range(392)
-optim = pyro.optim.Adam({"lr": 0.001})
-svi = pyro.infer.SVI(model, guide, optim, loss=pyro.infer.Trace_ELBO())
+idx = np.arange(392)
+
+svi = pyro.infer.SVI(AAE.model, AAE.guide,
+         pyro.optim.Adam({"lr": 0.01}),
+         loss=pyro.infer.Trace_ELBO()
+      )
 
 # Iterate
 for it in np.arange(iters)+2:
+   if it > 10:
+      svi = pyro.infer.SVI(AAE.model, AAE.guide,
+               pyro.optim.Adam({"lr": 0.001}),
+               loss=pyro.infer.Trace_ELBO()
+            )
    if it > 20:
-      optim = pyro.optim.Adam({"lr": 0.0001})
+      svi = pyro.infer.SVI(AAE.model, AAE.guide,
+               pyro.optim.Adam({"lr": 0.0001}),
+               loss=pyro.infer.Trace_ELBO()
+            )
+   loss = 0.0 
    for step in range(1000):
-      svi.step(AAE, obs, idx)
+      loss += float(svi.step(obs, idx))
    mu = pyro.param("mu")
    sd = pyro.param("sd")
-   smpl = Normal(mu,sd).sample()
-   (a,b) = AAE.decoder(smpl)
-   x = torch.zeros(test_samples.shape, device='cuda', dtype=torch.float32)
-   for _ in range(5):
-      x += Beta(a,b).sample()
-   x /= 5
+   with torch.no_grad():
+      smplz = Normal(mu,sd).sample()
+      (a,b) = AAE.decoder(smplz)
+      x = sum([Beta(a,b).sample() / 5 for _ in range(5)])
    x[:,:392] = test_samples[:,:392]
    image[:,(it*28):((it+1)*28)] = x.detach().to('cpu').view(-1,28).numpy()
 
