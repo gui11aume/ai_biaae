@@ -112,7 +112,7 @@ class AdversarialAutoEncoder(nn.Module):
       with pyro.plate('batch', obs.shape[0], device=obs.device):
          pyro.sample('z', dist.Normal(mu,sd).to_event(1))
 
-   def optimize(self, train_data, epochs, batch_size=128):
+   def optimize(self, train_data, epochs, batch_size=1024):
       lossf=func.binary_cross_entropy
 
       encoder_optimizer = \
